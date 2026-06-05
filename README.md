@@ -83,6 +83,7 @@ sudo nano /etc/systemd/system/discord-bot.service.d/env.conf
 | `DISCORD_BOT_TOKEN` | ✅ | Bot トークン |
 | `ANTHROPIC_API_KEY` | ✅ | Anthropic API キー |
 | `ANTHROPIC_MODEL` | 任意 | モデル名（既定 `claude-sonnet-4-6`） |
+| `ANTHROPIC_BASE_URL` | 任意 | Anthropic API のベース URL（未設定時は SDK デフォルト） |
 | `SYSTEM_PROMPT` | 任意 | システムプロンプト（スペースを含む値は `Environment="KEY=..."` と全体をクオート） |
 
 ### 4. 起動
