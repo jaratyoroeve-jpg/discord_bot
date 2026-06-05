@@ -39,6 +39,19 @@ discord-bot/
 
 Gateway 方式なので待ち受けポートは不要。**systemd で常駐させるだけ**でよい。
 
+#### 2-0. 事前準備
+
+1. [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) をインストールして `gcloud init` で認証
+2. [console.cloud.google.com/projectcreate](https://console.cloud.google.com/projectcreate) でプロジェクトを作成
+3. gcloud にプロジェクトを設定:
+   ```bash
+   gcloud config set project <your-project-id>
+   ```
+4. Compute Engine API を有効化:
+   ```bash
+   gcloud services enable compute.googleapis.com --project=<your-project-id>
+   ```
+
 #### 2-1. VM インスタンスを作成
 
 ```bash
@@ -47,7 +60,8 @@ gcloud compute instances create discord-bot \
   --machine-type=e2-micro \
   --image-family=debian-12 \
   --image-project=debian-cloud \
-  --zone=us-central1-a
+  --zone=us-central1-a \
+  --project=<your-project-id>
 ```
 
 > インバウンドのファイアウォール開放は不要（Bot は外向きに接続するだけ）。
@@ -57,10 +71,9 @@ gcloud compute instances create discord-bot \
 
 ```bash
 # VM に SSH 接続
-gcloud compute ssh discord-bot --zone=us-central1-a
+gcloud compute ssh discord-bot --zone=us-central1-a --project=<your-project-id>
 
 # セットアップスクリプトを実行（Python・systemd を一括構成）
-#   REPO_URL は自分のリポジトリに置き換える
 sudo REPO_URL="https://github.com/<your-account>/discord_bot.git" bash -c \
   "$(curl -fsSL https://raw.githubusercontent.com/<your-account>/discord_bot/main/deploy/setup.sh)"
 ```
@@ -82,9 +95,17 @@ sudo nano /etc/systemd/system/discord-bot.service.d/env.conf
 |------|------|------|
 | `DISCORD_BOT_TOKEN` | ✅ | Bot トークン |
 | `ANTHROPIC_API_KEY` | ✅ | Anthropic API キー |
-| `ANTHROPIC_MODEL` | 任意 | モデル名（既定 `claude-sonnet-4-6`） |
+| `ANTHROPIC_MODEL` | 任意 | モデル名（既定 `claude-sonnet-4-6`）。利用可能なモデルは下表参照 |
 | `ANTHROPIC_BASE_URL` | 任意 | Anthropic API のベース URL（未設定時は SDK デフォルト） |
 | `SYSTEM_PROMPT` | 任意 | システムプロンプト（スペースを含む値は `Environment="KEY=..."` と全体をクオート） |
+
+**利用可能なモデル名:**
+
+| モデル | ID |
+|--------|-----|
+| Claude Haiku 4.5（速・安） | `claude-haiku-4-5-20251001` |
+| Claude Sonnet 4.6（バランス） | `claude-sonnet-4-6` |
+| Claude Opus 4.8（高性能） | `claude-opus-4-8` |
 
 ### 4. 起動
 
@@ -92,11 +113,22 @@ sudo nano /etc/systemd/system/discord-bot.service.d/env.conf
 sudo systemctl daemon-reload      # env.conf を編集したら必要
 sudo systemctl restart discord-bot
 
-# ログ確認（"✅ ログイン完了" が出れば成功）
-sudo journalctl -u discord-bot -f
+# サービス状態確認
+sudo systemctl status discord-bot
 ```
 
 Discord 上で Bot にメンション（`@BotName こんにちは`）すると返信が来る。
+
+#### 停止・無効化
+
+```bash
+# 一時停止（VM 再起動後は自動で再開する）
+sudo systemctl stop discord-bot
+
+# 自動起動を無効化してから停止（VM 再起動後も起動しない）
+sudo systemctl disable discord-bot
+sudo systemctl stop discord-bot
+```
 
 #### コード更新時の再デプロイ
 

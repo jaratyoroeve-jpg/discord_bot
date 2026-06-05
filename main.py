@@ -1,8 +1,11 @@
 """
 Discord Gateway ボット（on_message 方式）
 
-Discord の Gateway に WebSocket で接続し、Bot へのメンションに反応して
-Anthropic API（Claude）の返答を送る。公開HTTPSエンドポイントは不要。
+Discord の Gateway に WebSocket で接続し、チャンネル監視セッションを管理する。
+- メンション + "start" でそのチャンネルの監視を開始
+- 監視中チャンネルの全メッセージを Anthropic API へ転送して返答
+- メンション + "end" で監視を終了
+- 監視中に別チャンネルからメンションされたら "busy" と返す
 """
 import logging
 import os
@@ -12,7 +15,6 @@ import anthropic
 import discord
 
 # Windows コンソール（cp932）でも絵文字・日本語ログを出せるよう UTF-8 に固定。
-# Linux は元から UTF-8 なので影響なし。
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
@@ -22,21 +24,18 @@ for _stream in (sys.stdout, sys.stderr):
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")  # 未設定時は SDK デフォルト
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
 
-# discord.py が client.run() で設定するハンドラ（"discord" ロガー）を継承するため、
-# あえて "discord." 配下の名前にする。独立した名前だとハンドラが無く INFO が破棄される。
 logger = logging.getLogger("discord.bot")
 
-
-# ──────────────────────────────────────────────
-# Anthropic API 呼び出し
-# ──────────────────────────────────────────────
 _anthropic = anthropic.AsyncAnthropic(
     api_key=ANTHROPIC_API_KEY,
     **({"base_url": ANTHROPIC_BASE_URL} if ANTHROPIC_BASE_URL else {}),
 )
+
+# 現在監視中のチャンネルID（None = 監視していない）
+active_channel_id: int | None = None
 
 
 async def call_anthropic(user_message: str) -> str:
@@ -49,11 +48,8 @@ async def call_anthropic(user_message: str) -> str:
     return message.content[0].text
 
 
-# ──────────────────────────────────────────────
-# Discord クライアント
-# ──────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True  # メンション本文の取得に必要（Developer Portal で要ON）
+intents.message_content = True
 client = discord.Client(intents=intents)
 
 
@@ -62,35 +58,61 @@ async def on_ready():
     logger.info("✅ ログイン完了: %s (id=%s)", client.user, client.user.id)
 
 
+def _extract_clean(message: discord.Message) -> str:
+    text = message.content
+    for mention in (f"<@{client.user.id}>", f"<@!{client.user.id}>"):
+        text = text.replace(mention, "")
+    return text.strip()
+
+
+async def _reply_anthropic(message: discord.Message, text: str) -> None:
+    async with message.channel.typing():
+        try:
+            reply = await call_anthropic(text)
+        except Exception as e:
+            reply = f"❌ エラーが発生しました: {e}"
+    for chunk in _split(reply, 2000):
+        await message.reply(chunk, mention_author=False)
+
+
 @client.event
 async def on_message(message: discord.Message):
-    # 自分・他Botのメッセージは無視
+    global active_channel_id
+
     if message.author.bot:
         return
 
-    # Bot へのメンションがある場合のみ反応
-    if client.user not in message.mentions:
-        return
+    is_mention = client.user in message.mentions
+    is_active = message.channel.id == active_channel_id
 
-    # メンション表記を除去して本文だけ取り出す
-    clean_message = message.content
-    for mention in (f"<@{client.user.id}>", f"<@!{client.user.id}>"):
-        clean_message = clean_message.replace(mention, "")
-    clean_message = clean_message.strip()
+    if is_mention:
+        clean = _extract_clean(message)
+        cmd = clean.lower()
 
-    if not clean_message:
-        return
+        if cmd == "/start":
+            if active_channel_id is None or is_active:
+                active_channel_id = message.channel.id
+                await message.channel.send("start")
+            else:
+                await message.reply(f"I'm busy, stay in <#{active_channel_id}>", mention_author=False)
+            return
 
-    # 入力中インジケータを出しつつ Claude に問い合わせ
-    async with message.channel.typing():
-        try:
-            reply = await call_anthropic(clean_message)
-        except Exception as e:
-            reply = f"❌ エラーが発生しました: {e}"
+        if cmd == "/end":
+            if is_active:
+                active_channel_id = None
+                await message.channel.send("end")
+            return
 
-    # Discord は1メッセージ2000文字制限。超える場合は分割して返信。
-    for chunk in _split(reply, 2000):
-        await message.reply(chunk, mention_author=False)
+        # start/end 以外のメンション
+        if is_active:
+            await _reply_anthropic(message, clean)
+        elif active_channel_id is not None:
+            await message.reply(f"I'm busy, stay in <#{active_channel_id}>", mention_author=False)
+
+    else:
+        # メンションなし：監視中チャンネルの発言は Anthropic へ転送
+        if is_active:
+            await _reply_anthropic(message, message.content)
 
 
 def _split(text: str, size: int):
