@@ -22,6 +22,7 @@ for _stream in (sys.stdout, sys.stderr):
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")  # 未設定時は SDK デフォルト
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
 
 # discord.py が client.run() で設定するハンドラ（"discord" ロガー）を継承するため、
@@ -34,7 +35,7 @@ logger = logging.getLogger("discord.bot")
 # ──────────────────────────────────────────────
 _anthropic = anthropic.AsyncAnthropic(
     api_key=ANTHROPIC_API_KEY,
-    base_url="http://127.0.0.1:8082", # ローカルプロキシを使う場合の例。通常は https://api.anthropic.com など Anthropic のエンドポイントを指定する。
+    **({"base_url": ANTHROPIC_BASE_URL} if ANTHROPIC_BASE_URL else {}),
 )
 
 
