@@ -1,0 +1,28 @@
+# systemd ユニットファイル
+# 配置先: /etc/systemd/system/discord-bot.service
+# 有効化: sudo systemctl enable --now discord-bot
+
+[Unit]
+Description=Discord -> Anthropic Gateway Bot (discord.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/discord_bot
+# 環境変数はドロップインで供給する:
+#   /etc/systemd/system/discord-bot.service.d/env.conf
+# （deploy/env.conf.example をコピーして編集。リポジトリ外なので git pull の影響を受けない）
+# Gateway 接続はアウトバウンドのみ。待ち受けポートは不要。
+ExecStart=/opt/discord_bot/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+# セキュリティ強化（任意）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
