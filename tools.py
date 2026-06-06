@@ -114,6 +114,7 @@ TOOLS: list[dict] = [
             "戦闘終了・ダンジョン踏破・場面の大きな区切りなど、シーン変わり目で使用してください。"
             "セッションログを読み取り、Anthropic APIで要約を生成してログ行番号付きで返します。"
             "このツールを呼び出すと、過去の会話履歴は要約に置き換えられ、コンテキストが節約されます。"
+            "章の区切りには compress_context ではなく advance_chapter を使用してください。"
         ),
         "input_schema": {
             "type": "object",
@@ -124,6 +125,31 @@ TOOLS: list[dict] = [
                 }
             },
             "required": [],
+        },
+    },
+    {
+        "name": "advance_chapter",
+        "description": (
+            "現在の章を終了し、新しい章を開始します。"
+            "ゲーム開始時・キャラクター作成完了後・GMが章の区切りと判断した際に使用してください。"
+            "内部で自動的に現在のシーンを圧縮し、この章のすべてのシーン要約を前章要約にまとめます。"
+            "戦闘や小さな場面転換には compress_context を使用してください。"
+            "新しい章の概要・目的・終了条件を chapter_overview に指定してください。"
+            "結果は JSON 形式で返ります。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chapter_overview": {
+                    "type": "string",
+                    "description": "新しい章の概要、目的、終了条件（例: '第2章: 魔王の城へ。目的: 同盟者を3人集める。終了条件: 同盟者獲得または全滅'）",
+                },
+                "scene_description": {
+                    "type": "string",
+                    "description": "現在のシーンの説明（残りログ圧縮の品質向上のためのヒント）",
+                },
+            },
+            "required": ["chapter_overview"],
         },
     },
 ]
@@ -271,6 +297,59 @@ async def _tool_compress_context(
     return f"[前シーンの要約 (ログ行: {scene_start_line + 1}-{total_line_count})]\n\n{summary}"
 
 
+async def _tool_advance_chapter(
+    tool_input: dict,
+    session_id: str,
+    sessions_dir: Path,
+    anthropic_client,
+    model: str,
+    scene_start_line: int = 0,
+    scene_summaries: list[str] | None = None,
+) -> str:
+    chapter_overview = tool_input.get("chapter_overview", "")
+
+    # Step 1: 残っている生ログをシーン圧縮
+    compress_input = {}
+    if sd := tool_input.get("scene_description"):
+        compress_input["scene_description"] = sd
+
+    current_scene = await _tool_compress_context(
+        compress_input, session_id, sessions_dir, anthropic_client, model, scene_start_line
+    )
+
+    # 有効なシーン要約のみ収集（エラーは除外）
+    all_summaries = list(scene_summaries or [])
+    if current_scene and not current_scene.startswith("エラー:"):
+        all_summaries.append(current_scene)
+
+    # Step 2: 全シーン要約を前章要約に統合
+    chapter_summary = ""
+    if all_summaries:
+        combined = "\n\n---\n\n".join(all_summaries)
+        system = (
+            "あなたはTRPGセッションの記録係です。"
+            "以下の複数のシーン要約を読み、1つの章の要約としてまとめてください。"
+            "重要なイベント・決定事項・キャラクターの成長・場面の転換を中心に整理し、"
+            "次の章でGMとプレイヤーが振り返れる形で箇条書きにまとめてください。"
+            "600文字以内に収めてください。"
+        )
+        try:
+            resp = await anthropic_client.messages.create(
+                model=model,
+                max_tokens=1024,
+                system=system,
+                messages=[{"role": "user", "content": combined}],
+            )
+            chapter_summary = next((b.text for b in resp.content if b.type == "text"), "")
+        except Exception as e:
+            return json.dumps({"error": f"章要約の生成に失敗しました: {e}"}, ensure_ascii=False)
+
+    return json.dumps(
+        {"chapter_summary": chapter_summary, "chapter_overview": chapter_overview},
+        ensure_ascii=False,
+    )
+
+
 async def execute_tool(
     name: str,
     tool_input: dict,
@@ -281,6 +360,7 @@ async def execute_tool(
     anthropic_client=None,
     model: str | None = None,
     scene_start_line: int = 0,
+    scene_summaries: list[str] | None = None,
 ) -> str:
     """ツールを実行して結果を文字列で返す。"""
     if name == "get_current_datetime":
@@ -318,5 +398,12 @@ async def execute_tool(
         if not session_id or not sessions_dir or not anthropic_client or not model:
             return "エラー: compress_context はアクティブなセッション内でのみ使用できます"
         return await _tool_compress_context(tool_input, session_id, sessions_dir, anthropic_client, model, scene_start_line)
+
+    if name == "advance_chapter":
+        if not session_id or not sessions_dir or not anthropic_client or not model:
+            return json.dumps({"error": "advance_chapter はアクティブなセッション内でのみ使用できます"}, ensure_ascii=False)
+        return await _tool_advance_chapter(
+            tool_input, session_id, sessions_dir, anthropic_client, model, scene_start_line, scene_summaries or []
+        )
 
     return f"不明なツール: {name}"
