@@ -232,7 +232,7 @@ def _build_messages(messages: list[dict]) -> list[dict]:
         return messages
     preamble = [
         {"role": "user", "content": _context_doc},
-        {"role": "assistant", "content": "Context loaded."},
+        {"role": "gamemaster", "content": "Context loaded."},
     ]
     return preamble + messages
 
@@ -313,11 +313,13 @@ def _extract_clean(message: discord.Message) -> str:
 
 
 async def _reply_anthropic(message: discord.Message, text: str) -> None:
+    nick = message.author.display_name
+    labeled = f"[{nick}]: {text}"
     if _context:
-        _context.add("user", text)
+        _context.add("user", labeled)
         ctx_messages = _context.messages()
     else:
-        ctx_messages = [{"role": "user", "content": text}]
+        ctx_messages = [{"role": "user", "content": labeled}]
 
     async with message.channel.typing():
         try:
