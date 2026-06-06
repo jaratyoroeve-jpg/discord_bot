@@ -68,9 +68,14 @@ def _log(session_id: str, role: str, content) -> None:
 class ContextAssembler:
     """セッション中の会話履歴を保持し、ログへの書き込みを一元管理する。"""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, scene_summary: str | None = None, scene_start_line: int = 0) -> None:
         self.session_id = session_id
+        self.scene_start_line = scene_start_line  # log.jsonl で現シーンが始まる行インデックス（0始まり）
         self._messages: list[dict] = []
+        if scene_summary:
+            # 前シーンの要約をプリアンブルとして注入（ログには書かない）
+            self._messages.append({"role": "user", "content": scene_summary})
+            self._messages.append({"role": "assistant", "content": "前シーンの内容を確認しました。"})
 
     def add(self, role: str, content: str) -> None:
         """メッセージを履歴に追加し、同時にログへ書き込む（重複なし）。"""
@@ -137,13 +142,14 @@ def _build_messages(messages: list[dict]) -> list[dict]:
     return preamble + messages
 
 
-async def call_anthropic(messages: list[dict]) -> str:
+async def call_anthropic(messages: list[dict]) -> tuple[str, str | None]:
     """Anthropic API を呼び出すエージェントループ（tool_use 対応）。
 
     messages はコンテキスト会話履歴。ツール呼び出しが発生した場合は
-    内部コピーでループを回し、最終的なテキスト応答だけを返す。
+    内部コピーでループを回し、最終的なテキスト応答と、compress_context が
+    呼ばれた場合はシーン要約文字列を返す。
     """
-    # ツール呼び出しの往復は内部コピーで管理し、呼び出し元の履歴に影響させない。
+    scene_summary: str | None = None
     working = list(messages)
     system = [{"type": "text", "text": _build_system(), "cache_control": {"type": "ephemeral"}}]
 
@@ -160,7 +166,7 @@ async def call_anthropic(messages: list[dict]) -> str:
         text = next((b.text for b in response.content if b.type == "text"), "")
 
         if response.stop_reason != "tool_use":
-            return text
+            return text, scene_summary
 
         # ---- tool_use: アシスタントの応答を working に追加 ----
         assistant_content = []
@@ -181,8 +187,18 @@ async def call_anthropic(messages: list[dict]) -> str:
         for b in response.content:
             if b.type == "tool_use":
                 logger.info("🔧 tool_use: name=%s input=%s", b.name, b.input)
-                result = await execute_tool(b.name, b.input, docs_dir=CONTEXT_DOCS_DIR)
+                result = await execute_tool(
+                    b.name, b.input,
+                    docs_dir=CONTEXT_DOCS_DIR,
+                    session_id=active_session_id,
+                    sessions_dir=SESSIONS_DIR,
+                    anthropic_client=_anthropic,
+                    model=ANTHROPIC_MODEL,
+                    scene_start_line=_context.scene_start_line if _context else 0,
+                )
                 logger.info("🔧 tool_result: %s", result)
+                if b.name == "compress_context":
+                    scene_summary = result
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": b.id,
@@ -214,6 +230,7 @@ def _extract_clean(message: discord.Message) -> str:
 
 
 async def _reply_anthropic(message: discord.Message, text: str) -> None:
+    global _context
     nick = message.author.display_name
     labeled = f"[{nick}]: {text}"
     if _context:
@@ -224,12 +241,23 @@ async def _reply_anthropic(message: discord.Message, text: str) -> None:
 
     async with message.channel.typing():
         try:
-            reply = await call_anthropic(ctx_messages)
+            reply, scene_summary = await call_anthropic(ctx_messages)
         except Exception as e:
             reply = f"❌ エラーが発生しました: {e}"
+            scene_summary = None
 
     if _context:
         _context.add("assistant", reply)
+
+    if scene_summary and _context:
+        old_session_id = _context.session_id
+        log_path = SESSIONS_DIR / old_session_id / "log.jsonl"
+        try:
+            next_start = sum(1 for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip())
+        except Exception:
+            next_start = 0
+        _context = ContextAssembler(old_session_id, scene_summary=scene_summary, scene_start_line=next_start)
+        logger.info("🗜 シーン圧縮完了: session=%s 次シーン開始行=%d", old_session_id, next_start)
 
     for chunk in _split(reply, 2000):
         await message.reply(chunk, mention_author=False)
