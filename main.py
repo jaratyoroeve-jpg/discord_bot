@@ -227,12 +227,35 @@ def _build_system() -> str:
     return base
 
 
+def _parse_jsonl_history(text: str) -> list[dict] | None:
+    """JSONL形式の会話ログを [{role, content}, ...] に変換する。
+    1行でもパース失敗 or role が不正な場合は None を返す。"""
+    result = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        role = entry.get("role")
+        content = entry.get("content")
+        if role not in ("user", "assistant") or content is None:
+            return None
+        result.append({"role": role, "content": content})
+    return result or None
+
+
 def _build_messages(messages: list[dict]) -> list[dict]:
     if not _context_doc:
         return messages
+    history = _parse_jsonl_history(_context_doc)
+    if history is not None:
+        return history + messages
     preamble = [
         {"role": "user", "content": _context_doc},
-        {"role": "gamemaster", "content": "Context loaded."},
+        {"role": "assistant", "content": "Context loaded."},
     ]
     return preamble + messages
 
