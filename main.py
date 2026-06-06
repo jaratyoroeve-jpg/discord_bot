@@ -268,12 +268,13 @@ async def call_anthropic(messages: list[dict]) -> str:
     """
     # ツール呼び出しの往復は内部コピーで管理し、呼び出し元の履歴に影響させない。
     working = list(messages)
+    system = [{"type": "text", "text": _build_system(), "cache_control": {"type": "ephemeral"}}]
 
     while True:
         response = await _anthropic.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
-            system=_build_system(),
+            system=system,
             tools=TOOLS,
             messages=_build_messages(working),
         )
