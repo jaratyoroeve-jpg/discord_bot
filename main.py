@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -32,7 +33,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
-SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "sessions"))
+SESSION_BASE = Path(os.getenv("SESSION_BASE", "game_data"))
 CONTEXT_DOCS_DIR = Path(os.getenv("CONTEXT_DOCS_DIR", "docs"))
 # sysprompt系: ペルソナ・ルール → system フィールドに追記
 SYSTEM_PROMPT_DOC = os.getenv("SYSTEM_PROMPT_DOC")  # 基本プロンプト (.md)
@@ -58,7 +59,7 @@ logger = logging.getLogger("discord.bot")
 
 
 def _log(session_id: str, role: str, content) -> None:
-    session_dir = SESSIONS_DIR / session_id
+    session_dir = SESSION_BASE / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     entry = {"role": role, "content": content}
     with (session_dir / "log.jsonl").open("a", encoding="utf-8") as f:
@@ -173,7 +174,7 @@ async def call_anthropic(messages: list[dict]) -> tuple[str, str | None, str | N
     while True:
         response = await _anthropic.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             system=system,
             tools=TOOLS,
             messages=_build_messages(working),
@@ -208,11 +209,12 @@ async def call_anthropic(messages: list[dict]) -> tuple[str, str | None, str | N
                     b.name, b.input,
                     docs_dir=CONTEXT_DOCS_DIR,
                     session_id=active_session_id,
-                    sessions_dir=SESSIONS_DIR,
+                    sessions_dir=SESSION_BASE,
                     anthropic_client=_anthropic,
                     model=ANTHROPIC_MODEL,
                     scene_start_line=_context.scene_start_line if _context else 0,
                     scene_summaries=_context.scene_summaries if _context else [],
+                    characters_dir=SESSION_BASE / active_session_id / "characters" if active_session_id else SESSION_BASE / "characters",
                 )
                 logger.info("🔧 tool_result: %s", result)
                 if b.name == "compress_context":
@@ -271,7 +273,7 @@ async def _reply_anthropic(message: discord.Message, text: str) -> None:
         _context.add("assistant", reply)
 
     def _count_log_lines(session_id: str) -> int:
-        log_path = SESSIONS_DIR / session_id / "log.jsonl"
+        log_path = SESSION_BASE / session_id / "log.jsonl"
         try:
             return sum(1 for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip())
         except Exception:
@@ -326,6 +328,8 @@ async def on_message(message: discord.Message):
 
         if cmd == "/start":
             if active_channel_id is None or is_active:
+                if SESSION_BASE.exists():
+                    shutil.rmtree(SESSION_BASE)
                 active_channel_id = message.channel.id
                 active_session_id = str(uuid.uuid4())
                 _context = ContextAssembler(active_session_id)

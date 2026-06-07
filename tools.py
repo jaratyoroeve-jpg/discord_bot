@@ -10,6 +10,9 @@ import random
 import re
 from pathlib import Path
 
+# キャラクターシートのネストdictフィールド（キー単位でマージする対象）
+_CHAR_NESTED_DICTS = {"hp", "ability_scores", "death_saves", "spell_slots", "currency"}
+
 
 # ---------------------------------------------------------------------------
 # Tool definitions (Anthropic API 形式)
@@ -111,7 +114,7 @@ TOOLS: list[dict] = [
         "name": "compress_context",
         "description": (
             "現在のシーンの会話履歴を要約し、コンテキストを圧縮します。"
-            "戦闘終了・ダンジョン踏破・場面の大きな区切りなど、シーン変わり目で使用してください。"
+            "戦闘終了・ダンジョン踏破・会話終了・場面の大きな区切りなど、章内のシーン変わり目で使用してください。"
             "セッションログを読み取り、Anthropic APIで要約を生成してログ行番号付きで返します。"
             "このツールを呼び出すと、過去の会話履歴は要約に置き換えられ、コンテキストが節約されます。"
             "章の区切りには compress_context ではなく advance_chapter を使用してください。"
@@ -125,6 +128,70 @@ TOOLS: list[dict] = [
                 }
             },
             "required": [],
+        },
+    },
+    {
+        "name": "list_characters",
+        "description": (
+            "登録されているすべてのキャラクターの一覧を取得します。"
+            "各キャラクターの名前・プレイヤー名・クラス・レベル・HP を表示します。"
+            "セッション開始時やキャラクター確認が必要な場面で使用してください。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_character_sheet",
+        "description": (
+            "キャラクターシートを取得します。"
+            "HP・能力値・AC・アイテム・状態異常・スペルスロットなどの全情報を JSON で返します。"
+            "戦闘中の状態確認・判定の補助・アイテム効果の確認に使用してください。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "character_name": {
+                    "type": "string",
+                    "description": "取得するキャラクター名（例: 'Thorin'）",
+                }
+            },
+            "required": ["character_name"],
+        },
+    },
+    {
+        "name": "update_character_sheet",
+        "description": (
+            "キャラクターシートを更新します。"
+            "HP変化・状態異常の付与/解除・アイテムの追加/削除・能力値変更・死亡セーヴなどに使用します。"
+            "キャラクターが存在しない場合は新規作成します。"
+            "updates に変更するフィールドを指定してください。"
+            "hp / ability_scores / death_saves / spell_slots / currency はキー単位でマージします。"
+            "conditions / inventory / features などの配列は全体を置き換えます。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "character_name": {
+                    "type": "string",
+                    "description": "更新するキャラクター名",
+                },
+                "updates": {
+                    "type": "object",
+                    "description": (
+                        "更新するフィールドと値。例: "
+                        '{"hp": {"current": 8}, "conditions": ["Poisoned"]} '
+                        "または "
+                        '{"ability_scores": {"STR": 18}, "level": 2, "inventory": ['
+                        '{"name": "Longsword +1", "description": "魔法の剣", "weight": 3, '
+                        '"value": "1000 gp", "bonus_stats": {"attack_bonus": 1, "damage_bonus": 1}, '
+                        '"effect": "この武器での攻撃は魔法攻撃として扱われる"}]}'
+                    ),
+                },
+            },
+            "required": ["character_name", "updates"],
         },
     },
     {
@@ -183,6 +250,113 @@ def _safe_eval(expr: str) -> float:
         raise ValueError(f"サポートされていない式です: {ast.dump(node)}")
     tree = ast.parse(expr, mode="eval")
     return _eval(tree.body)
+
+
+def _default_character_sheet(character_name: str) -> dict:
+    return {
+        "character_name": character_name,
+        "player_name": "",
+        "race": "",
+        "class": "",
+        "level": 1,
+        "background": "",
+        "alignment": "",
+        "experience_points": 0,
+        "ability_scores": {
+            "STR": 10, "DEX": 10, "CON": 10,
+            "INT": 10, "WIS": 10, "CHA": 10,
+        },
+        "hp": {"max": 0, "current": 0, "temp": 0},
+        "ac": 10,
+        "initiative": 0,
+        "speed": 30,
+        "proficiency_bonus": 2,
+        "saving_throw_proficiencies": [],
+        "skill_proficiencies": [],
+        "skill_expertise": [],
+        "death_saves": {"successes": 0, "failures": 0},
+        "spell_slots": {},
+        "conditions": [],
+        "features": [],
+        "inventory": [],
+        "currency": {"cp": 0, "sp": 0, "ep": 0, "gp": 0, "pp": 0},
+        "notes": "",
+    }
+
+
+def _character_path(characters_dir: Path, character_name: str) -> Path:
+    safe_name = re.sub(r"[^\w\-]", "_", character_name)
+    return characters_dir / f"{safe_name}.json"
+
+
+def _tool_list_characters(characters_dir: Path) -> str:
+    characters_dir.mkdir(parents=True, exist_ok=True)
+    sheets = sorted(characters_dir.glob("*.json"))
+    if not sheets:
+        return "キャラクターが登録されていません。"
+    lines = []
+    for sheet_path in sheets:
+        try:
+            data = json.loads(sheet_path.read_text(encoding="utf-8"))
+            name = data.get("character_name", sheet_path.stem)
+            player = data.get("player_name") or "未設定"
+            cls = data.get("class") or "不明"
+            level = data.get("level", 1)
+            hp = data.get("hp", {})
+            hp_str = f"{hp.get('current', '?')}/{hp.get('max', '?')}"
+            conds = data.get("conditions", [])
+            cond_str = f" [{', '.join(conds)}]" if conds else ""
+            lines.append(f"- {name} (Player: {player} | {cls} Lv.{level} | HP: {hp_str}{cond_str})")
+        except Exception:
+            lines.append(f"- {sheet_path.stem} (読み込みエラー)")
+    return "\n".join(lines)
+
+
+def _tool_get_character_sheet(tool_input: dict, characters_dir: Path) -> str:
+    character_name = tool_input.get("character_name", "")
+    if not character_name:
+        return "エラー: character_name を指定してください"
+    characters_dir.mkdir(parents=True, exist_ok=True)
+    path = _character_path(characters_dir, character_name)
+    if not path.exists():
+        return f"エラー: キャラクター '{character_name}' が見つかりません"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _tool_update_character_sheet(tool_input: dict, characters_dir: Path) -> str:
+    character_name = tool_input.get("character_name", "")
+    updates = tool_input.get("updates", {})
+    if not character_name:
+        return "エラー: character_name を指定してください"
+    if not updates:
+        return "エラー: updates を指定してください"
+
+    characters_dir.mkdir(parents=True, exist_ok=True)
+    path = _character_path(characters_dir, character_name)
+
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return f"エラー: シートの読み込みに失敗しました: {e}"
+    else:
+        data = _default_character_sheet(character_name)
+
+    for key, value in updates.items():
+        if key in _CHAR_NESTED_DICTS and isinstance(value, dict) and isinstance(data.get(key), dict):
+            data[key].update(value)
+        else:
+            data[key] = value
+
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return f"'{character_name}' のシートを更新しました。\n" + json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"エラー: {e}"
 
 
 def _tool_read_file(tool_input: dict, docs_dir: Path) -> str:
@@ -361,6 +535,7 @@ async def execute_tool(
     model: str | None = None,
     scene_start_line: int = 0,
     scene_summaries: list[str] | None = None,
+    characters_dir: Path | None = None,
 ) -> str:
     """ツールを実行して結果を文字列で返す。"""
     if name == "get_current_datetime":
@@ -393,6 +568,17 @@ async def execute_tool(
 
     if name == "grep_files":
         return _tool_grep_files(tool_input, docs_dir)
+
+    _chars_dir = characters_dir if characters_dir is not None else Path("characters")
+
+    if name == "list_characters":
+        return _tool_list_characters(_chars_dir)
+
+    if name == "get_character_sheet":
+        return _tool_get_character_sheet(tool_input, _chars_dir)
+
+    if name == "update_character_sheet":
+        return _tool_update_character_sheet(tool_input, _chars_dir)
 
     if name == "compress_context":
         if not session_id or not sessions_dir or not anthropic_client or not model:
