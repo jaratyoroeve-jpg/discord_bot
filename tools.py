@@ -219,6 +219,57 @@ TOOLS: list[dict] = [
             "required": ["chapter_overview"],
         },
     },
+    {
+        "name": "fork_scene",
+        "description": (
+            "現在のシーンから並行シーンを作成し、指定したキャラクターを新しいシーンへ移動します。"
+            "パーティが分かれて別々の行動をとる場面転換で使用してください。"
+            "新しいシーンは現在シーンの子シーンとなり、並行して進行します。"
+            "シーン圧縮（compress_context）は fork_scene の前後どちらでも可能です。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "characters": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "新しいシーンへ移動するキャラクター名のリスト（例: ['アレックス']）",
+                },
+            },
+            "required": ["characters"],
+        },
+    },
+    {
+        "name": "end_scene",
+        "description": (
+            "現在のシーンを終了し、参加者を指定のシーンへ合流させます。"
+            "並行シーンが収束してキャラクターが合流する際に使用してください。"
+            "このツールを呼ぶ前に compress_context でシーンを要約しておくと、"
+            "合流先のシーンにこのシーンの要約が伝わります。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_scene_id": {
+                    "type": "string",
+                    "description": "参加者の移動先シーン ID（例: '1', '1-1'）",
+                },
+            },
+            "required": ["target_scene_id"],
+        },
+    },
+    {
+        "name": "list_scenes",
+        "description": (
+            "現在アクティブなすべてのシーンとその参加者を一覧表示します。"
+            "シーン構造を確認したい場合や fork_scene / end_scene の前後に使用してください。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -411,17 +462,15 @@ def _tool_grep_files(tool_input: dict, docs_dir: Path) -> str:
 
 async def _tool_compress_context(
     tool_input: dict,
-    session_id: str,
-    sessions_dir: Path,
+    scene_log_path: Path,
     anthropic_client,
     model: str,
     scene_start_line: int = 0,
 ) -> str:
-    log_path = sessions_dir / session_id / "log.jsonl"
-    if not log_path.exists():
+    if not scene_log_path.exists():
         return "エラー: セッションログが見つかりません"
 
-    all_lines = [l for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    all_lines = [l for l in scene_log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     total_line_count = len(all_lines)
     # 現シーンの未圧縮部分だけを対象にする
     scene_lines = all_lines[scene_start_line:]
@@ -473,8 +522,7 @@ async def _tool_compress_context(
 
 async def _tool_advance_chapter(
     tool_input: dict,
-    session_id: str,
-    sessions_dir: Path,
+    scene_log_path: Path,
     anthropic_client,
     model: str,
     scene_start_line: int = 0,
@@ -488,7 +536,7 @@ async def _tool_advance_chapter(
         compress_input["scene_description"] = sd
 
     current_scene = await _tool_compress_context(
-        compress_input, session_id, sessions_dir, anthropic_client, model, scene_start_line
+        compress_input, scene_log_path, anthropic_client, model, scene_start_line
     )
 
     # 有効なシーン要約のみ収集（エラーは除外）
@@ -529,13 +577,14 @@ async def execute_tool(
     tool_input: dict,
     *,
     docs_dir: Path,
-    session_id: str | None = None,
-    sessions_dir: Path | None = None,
-    anthropic_client=None,
-    model: str | None = None,
+    scene_log_path: Path | None = None,
     scene_start_line: int = 0,
     scene_summaries: list[str] | None = None,
     characters_dir: Path | None = None,
+    anthropic_client=None,
+    model: str | None = None,
+    scene_manager=None,
+    current_scene_id: str | None = None,
 ) -> str:
     """ツールを実行して結果を文字列で返す。"""
     if name == "get_current_datetime":
@@ -581,15 +630,37 @@ async def execute_tool(
         return _tool_update_character_sheet(tool_input, _chars_dir)
 
     if name == "compress_context":
-        if not session_id or not sessions_dir or not anthropic_client or not model:
+        if not scene_log_path or not anthropic_client or not model:
             return "エラー: compress_context はアクティブなセッション内でのみ使用できます"
-        return await _tool_compress_context(tool_input, session_id, sessions_dir, anthropic_client, model, scene_start_line)
+        return await _tool_compress_context(tool_input, scene_log_path, anthropic_client, model, scene_start_line)
 
     if name == "advance_chapter":
-        if not session_id or not sessions_dir or not anthropic_client or not model:
+        if not scene_log_path or not anthropic_client or not model:
             return json.dumps({"error": "advance_chapter はアクティブなセッション内でのみ使用できます"}, ensure_ascii=False)
         return await _tool_advance_chapter(
-            tool_input, session_id, sessions_dir, anthropic_client, model, scene_start_line, scene_summaries or []
+            tool_input, scene_log_path, anthropic_client, model, scene_start_line, scene_summaries or []
         )
+
+    if name == "fork_scene":
+        if not scene_manager or not current_scene_id:
+            return "エラー: fork_scene はアクティブなセッション内でのみ使用できます"
+        chars = tool_input.get("characters", [])
+        if not chars:
+            return "エラー: characters を指定してください"
+        _, msg = scene_manager.fork_scene(current_scene_id, chars)
+        return msg
+
+    if name == "end_scene":
+        if not scene_manager or not current_scene_id:
+            return "エラー: end_scene はアクティブなセッション内でのみ使用できます"
+        target = tool_input.get("target_scene_id", "")
+        if not target:
+            return "エラー: target_scene_id を指定してください"
+        return scene_manager.end_scene(current_scene_id, target)
+
+    if name == "list_scenes":
+        if not scene_manager:
+            return "エラー: list_scenes はアクティブなセッション内でのみ使用できます"
+        return scene_manager.list_scenes()
 
     return f"不明なツール: {name}"
